@@ -7,20 +7,19 @@ Proves the end-to-end contract against a running docker compose stack:
   1. A valid heavy DOCX is picked up by the worker; while it is converting,
      the worker container is SIGKILLed and then started again. After the 30s
      lease expires another attempt converts from the ORIGINAL docx and the job
-     ends with exactly one downloadable PDF beginning with %PDF-.
-  2. A document that passes container validation but cannot render ends in a
-     terminal failure: reason is queryable and there is no download URL.
-  2. The recovered job's query response carries size + SHA-256 matching the
-     downloaded bytes; the digest is the download ETag and a matching
-     If-None-Match returns 304. Tampering with the official PDF on the shared
-     store then fails the download with a stable ARTIFACT_CORRUPTED envelope
-     (never a corrupt body, never a 304) without rewriting the task status.
+     ends with exactly one downloadable PDF beginning with %PDF-. That new job
+     reports size + SHA-256 matching the downloaded bytes; the digest is the
+     download ETag and a matching If-None-Match returns 304.
+  2. Tampering with the official PDF on the shared store makes the download
+     fail with a stable ARTIFACT_CORRUPTED envelope (never a corrupt body,
+     never a 304) without rewriting the task status; the run then continues.
   3. A document that passes container validation but cannot render ends in a
      terminal failure: reason is queryable and there is no download URL.
   4. Invalid containers never create a task, with stable error codes
      (NOT_A_ZIP / DOCX_MISSING_PARTS / FILE_TOO_LARGE / JOB_NOT_FOUND).
   5. Historical succeeded records without a fingerprint keep the original
-     query/download behavior (null fingerprint fields, no ETag, no 304).
+     query/download behavior: the fingerprint keys are absent, no ETag is
+     emitted and no conditional request returns 304.
 
 Run (compose):  docker compose --profile verify run --rm verify
 """
@@ -312,7 +311,8 @@ def check_tampered_artifact_rejected(job_id: str, digest: str) -> None:
                 "SELECT status, pdf_size, pdf_sha256, error_code FROM jobs "
                 "WHERE id = ?",
                 (job_id,),
-            ).one()
+            ).fetchone()
+            check(row is not None, "job row still exists after tamper detection")
             check(row[0] == "succeeded" and row[2] == digest,
                   f"job row is untouched (status={row[0]})")
             check(row[3] is None, "no error code is written onto the job")
@@ -415,9 +415,8 @@ def check_legacy_records_compatible(original_job_id: str) -> None:
         body = json.loads(raw)
         check(st == 200 and body["status"] == "succeeded",
               "legacy succeeded job is still queryable")
-        check(body.get("artifact_size") is None
-              and body.get("artifact_sha256") is None,
-              "legacy query omits the fingerprint (new fields are null)")
+        check("artifact_size" not in body and "artifact_sha256" not in body,
+              "legacy query omits the fingerprint keys entirely")
         check(body["download_url"] == f"/jobs/{legacy_id}/download",
               "legacy job keeps its original download URL")
 

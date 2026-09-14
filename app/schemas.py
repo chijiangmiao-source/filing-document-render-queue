@@ -21,8 +21,10 @@ class JobStatus(BaseModel):
     download_url: Optional[str] = None
     # Fingerprint of the finished artifact. Populated only for jobs that
     # succeeded after fingerprints were introduced (older succeeded rows and
-    # every non-terminal job report null); clients that predate the fields
-    # simply ignore them. artifact_sha256 is also the download ETag.
+    # every unfinished job carry neither value); the GET /jobs endpoint omits
+    # both keys entirely for such jobs rather than emitting null, so the wire
+    # shape is unchanged for pre-fingerprint clients. artifact_sha256 is also
+    # the download ETag.
     artifact_size: Optional[int] = None
     artifact_sha256: Optional[str] = None
     created_at: datetime

@@ -84,8 +84,10 @@ def _job_to_status(job: Job) -> JobStatus:
     succeeded = job.status == STATUS_SUCCEEDED
     download_url = f"/jobs/{job.id}/download" if succeeded else None
     # Fingerprints are reported only for successful jobs that were published
-    # with one (new records). Historical rows and unfinished jobs stay null,
-    # so older clients polling the same fields are unaffected.
+    # with one (new records). Historical rows and unfinished jobs resolve to
+    # None here, and the GET handler drops both keys from the JSON entirely so
+    # those responses keep their original shape; older clients polling the
+    # known fields are unaffected either way.
     artifact_size = job.pdf_size if (succeeded and job.pdf_sha256) else None
     artifact_sha256 = job.pdf_sha256 if succeeded else None
     return JobStatus(
@@ -159,9 +161,18 @@ def _load_job_or_404(db: Session, job_id: str) -> Job:
     return job
 
 
-@app.get("/jobs/{job_id}", response_model=JobStatus)
-def get_job(job_id: str, db: Session = Depends(get_session)) -> JobStatus:
-    return _job_to_status(_load_job_or_404(db, job_id))
+@app.get("/jobs/{job_id}", responses={200: {"model": JobStatus}})
+def get_job(job_id: str, db: Session = Depends(get_session)) -> Response:
+    status = _job_to_status(_load_job_or_404(db, job_id))
+    payload = jsonable_encoder(status)
+    # Fingerprint fields are present ONLY for successful jobs published with a
+    # fingerprint. Legacy succeeded rows and every unfinished job omit the keys
+    # entirely (not null), so the wire shape is byte-for-byte the old response;
+    # existing nullable fields such as error_code/download_url are untouched.
+    if status.artifact_sha256 is None:
+        payload.pop("artifact_size", None)
+        payload.pop("artifact_sha256", None)
+    return JSONResponse(payload)
 
 
 @app.get("/jobs/{job_id}/download")

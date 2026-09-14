@@ -167,10 +167,11 @@ def test_size_only_tamper_is_detected(clean_db):
 def test_legacy_succeeded_record_keeps_original_download_behavior(clean_db):
     jid = _legacy_succeeded_job()
     body = client.get(f"/jobs/{jid}").json()
-    # Old successful records expose no fingerprint fields-populated values.
+    # Old successful records omit the fingerprint keys entirely (not null),
+    # keeping the pre-fingerprint wire shape.
     assert body["status"] == STATUS_SUCCEEDED
-    assert body["artifact_size"] is None
-    assert body["artifact_sha256"] is None
+    assert "artifact_size" not in body
+    assert "artifact_sha256" not in body
     assert body["download_url"] == f"/jobs/{jid}/download"
 
     resp = client.get(f"/jobs/{jid}/download")
@@ -205,8 +206,8 @@ def test_unfinished_jobs_never_report_fingerprint(clean_db):
     jid = resp.json()["id"]
     body = client.get(f"/jobs/{jid}").json()
     assert body["status"] == STATUS_PENDING
-    assert body["artifact_size"] is None
-    assert body["artifact_sha256"] is None
+    assert "artifact_size" not in body
+    assert "artifact_sha256" not in body
     assert body["download_url"] is None
 
     # Failed.
@@ -221,7 +222,7 @@ def test_unfinished_jobs_never_report_fingerprint(clean_db):
         db.close()
     body = client.get(f"/jobs/{jid}").json()
     assert body["status"] == STATUS_FAILED
-    assert body["artifact_size"] is None
-    assert body["artifact_sha256"] is None
+    assert "artifact_size" not in body
+    assert "artifact_sha256" not in body
     assert body["download_url"] is None
     assert client.get(f"/jobs/{jid}/download").status_code == 409

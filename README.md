@@ -74,10 +74,10 @@ validator re-serves the bytes. Before serving a fingerprinted artifact the
 service re-hashes the file on the shared store: if its size or digest no
 longer matches the registered fingerprint — the store was modified out of
 band — delivery is refused with a stable `ARTIFACT_CORRUPTED` error and the
-task status is never rewritten. Both fields are additive: historical
-`succeeded` rows have no fingerprint and keep downloading exactly as before
-(no ETag, no verification), and clients that ignore the new fields poll
-unchanged.
+task status is never rewritten. Both fields are additive and appear **only** on successful, fingerprinted
+jobs: historical `succeeded` rows and every unfinished job omit the keys
+entirely (they are not returned as null), so the response keeps its original
+wire shape and clients that predate the fields poll unchanged.
 
 ## One-shot acceptance (`verify`)
 
@@ -87,10 +87,17 @@ again**, waits for the 30 s lease to expire and a re-run to finish, then
 asserts:
 
 * exactly **one** downloadable artifact exists and it starts with `%PDF-`;
+  its query fingerprint (size + SHA-256) matches the delivered bytes, the
+  digest is the ETag, and a matching `If-None-Match` returns **304**;
+* modifying the official PDF on shared storage is refused with
+  `ARTIFACT_CORRUPTED` (never a corrupt body, never a 304) and the task stays
+  `succeeded`;
 * a structurally-valid-but-unrenderable document ends **failed**, with a
   queryable `CONVERSION_FAILED` reason and **no** download URL;
 * invalid containers never create a task and return stable codes
-  (`NOT_A_ZIP`, `DOCX_MISSING_PARTS`, `FILE_TOO_LARGE`, `JOB_NOT_FOUND`).
+  (`NOT_A_ZIP`, `DOCX_MISSING_PARTS`, `FILE_TOO_LARGE`, `JOB_NOT_FOUND`);
+* a historical fingerprint-free success row keeps the original response
+  (fingerprint keys absent) and download behavior (no ETag, no 304).
 
 ```bash
 docker compose build
