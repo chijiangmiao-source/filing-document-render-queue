@@ -1,0 +1,70 @@
+name: docx2pdf
+
+services:
+  api:
+    build: .
+    image: docx2pdf:latest
+    command: ["api"]
+    ports:
+      # Host port is overridable: API_PORT=9000 docker compose up api
+      - "${API_PORT:-8080}:8000"
+    environment:
+      DATABASE_URL: sqlite:////data/docx2pdf.db
+      STORAGE_DIR: /data/storage
+      LEASE_SECONDS: "30"
+      RENEW_INTERVAL_SECONDS: "10"
+      MAX_ATTEMPTS: "3"
+    volumes:
+      - docxdata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    image: docx2pdf:latest
+    build: .
+    command: ["worker"]
+    environment:
+      DATABASE_URL: sqlite:////data/docx2pdf.db
+      STORAGE_DIR: /data/storage
+      LEASE_SECONDS: "30"
+      RENEW_INTERVAL_SECONDS: "10"
+      MAX_ATTEMPTS: "3"
+      LOG_LEVEL: INFO
+    volumes:
+      - docxdata:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    # No auto-restart: the acceptance verifier explicitly kills and then
+    # starts the worker to exercise the lease-takeover recovery path.
+    restart: "no"
+
+  # One-shot acceptance service: builds fixtures, kills the converting worker,
+  # restarts it, and asserts exactly one %PDF- artifact plus all error codes.
+  # Run with:  docker compose --profile verify run --rm verify
+  verify:
+    image: docx2pdf:latest
+    build: .
+    command: ["verify"]
+    profiles: ["verify"]
+    environment:
+      API_BASE: http://api:8000
+      STORAGE_DIR: /data/storage
+      WORKER_SERVICE: worker
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-docx2pdf}
+    volumes:
+      - docxdata:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    restart: "no"
+
+volumes:
+  docxdata:
