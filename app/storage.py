@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import uuid
@@ -66,6 +67,24 @@ def remove_quiet(path: str) -> None:
         os.remove(path)
     except FileNotFoundError:
         pass
+
+
+def file_fingerprint(path: str) -> tuple[int, str]:
+    """Return (byte size, hex SHA-256) of the file at ``path``.
+
+    Hashed in fixed-size chunks so a large artifact is never held twice in
+    memory alongside the bytes the worker already read for publication.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
 
 
 def cleanup_job_tmp(job_id: str) -> None:

@@ -57,6 +57,28 @@ curl -f -OJ http://localhost:9000/jobs/<id>/download
 `API_PORT` (default `8080`) sets the **host** port; the container always
 listens on 8000.
 
+## Artifact fingerprints
+
+Every job the worker publishes is fingerprinted: it computes the PDF's byte
+size and SHA-256 and the repository saves both in the **same gated
+transaction** that registers the official path. The status response of a
+successful, fingerprinted job carries the optional fields:
+
+```json
+{"status":"succeeded", "artifact_size":48213, "artifact_sha256":"ab12…", …}
+```
+
+The digest is also the download **ETag** (a strong validator). Sending it in
+`If-None-Match` answers **304 Not Modified** with no body; any other
+validator re-serves the bytes. Before serving a fingerprinted artifact the
+service re-hashes the file on the shared store: if its size or digest no
+longer matches the registered fingerprint — the store was modified out of
+band — delivery is refused with a stable `ARTIFACT_CORRUPTED` error and the
+task status is never rewritten. Both fields are additive: historical
+`succeeded` rows have no fingerprint and keep downloading exactly as before
+(no ETag, no verification), and clients that ignore the new fields poll
+unchanged.
+
 ## One-shot acceptance (`verify`)
 
 The `verify` profile builds a heavy real DOCX, waits for the worker to start
@@ -115,6 +137,7 @@ All errors use `{"error":{"code": ..., "message": ...}}` with fixed codes:
 | `JOB_NOT_FOUND`      | 404  | unknown id                                 |
 | `JOB_NOT_READY`      | 409  | no finished PDF yet (failed/in-flight)     |
 | `ARTIFACT_MISSING`   | 404  | registered artifact unavailable on disk    |
+| `ARTIFACT_CORRUPTED` | 500  | registered artifact's size/SHA-256 no longer matches the recorded fingerprint |
 | `CONVERSION_FAILED`  | 500  | LibreOffice could not render (stored reason)|
 | `VALIDATION_ERROR`   | 400  | malformed request                          |
 | `INTERNAL_ERROR`     | 500  | unexpected server error                    |

@@ -131,7 +131,19 @@ def process_job(db: Session, job, owner: str, settings: Settings) -> None:
             return
 
         final_pdf = storage.final_pdf_path(job.id)
-        published = repository.publish_success(db, job.id, owner, tmp_pdf, final_pdf)
+        # Fingerprint the exact bytes that are about to become official, while
+        # they still live at the temp path; the repository persists size+hash
+        # in the same gated transaction that registers the official path.
+        pdf_size, pdf_sha256 = storage.file_fingerprint(tmp_pdf)
+        published = repository.publish_success(
+            db,
+            job.id,
+            owner,
+            tmp_pdf,
+            final_pdf,
+            pdf_size,
+            pdf_sha256,
+        )
         if not published:
             # The lease expired (or was taken) between the last renewal and
             # the publish commit. Reject the late result; a live holder that

@@ -28,6 +28,10 @@ def _make_job():
         db.close()
 
 
+def _fp(path: str) -> tuple[int, str]:
+    return storage.file_fingerprint(path)
+
+
 def test_claim_pending_sets_lease_and_attempt(clean_db):
     jid = _make_job()
     s = get_settings()
@@ -119,7 +123,13 @@ def test_publish_gate_rejects_stale_owner(clean_db):
         job.lease_owner = "owner-B"
         db.commit()
 
-        assert repository.publish_success(db, jid, "owner-A", tmp, final) is False
+        size, digest = _fp(tmp)
+        assert (
+            repository.publish_success(
+                db, jid, "owner-A", tmp, final, size, digest
+            )
+            is False
+        )
         # Late result must be discarded by caller; nothing moved/registered.
         assert not os.path.exists(final)
         again = db.get(type(job), jid)
@@ -148,7 +158,13 @@ def test_expired_lease_still_named_me_fences_every_write(clean_db):
         db.commit()
 
         assert repository.renew_lease(db, jid, "owner-A", s) is False
-        assert repository.publish_success(db, jid, "owner-A", tmp, final) is False
+        size, digest = _fp(tmp)
+        assert (
+            repository.publish_success(
+                db, jid, "owner-A", tmp, final, size, digest
+            )
+            is False
+        )
         assert (
             repository.record_failure(db, jid, "owner-A", s,
                                       "CONVERSION_FAILED", "late") == ""
@@ -177,7 +193,13 @@ def test_late_publish_rejected_then_fresh_claim_converts_and_wins(clean_db):
         first.lease_expires_at = utcnow() - timedelta(seconds=1)
         db.commit()
         final = storage.final_pdf_path(jid)
-        assert repository.publish_success(db, jid, "slow", late_tmp, final) is False
+        late_size, late_digest = _fp(late_tmp)
+        assert (
+            repository.publish_success(
+                db, jid, "slow", late_tmp, final, late_size, late_digest
+            )
+            is False
+        )
 
         # A live worker re-claims from the expired lease and re-converts.
         second = repository.claim_next_job(db, "fast", s)
@@ -185,10 +207,18 @@ def test_late_publish_rejected_then_fresh_claim_converts_and_wins(clean_db):
         fresh_tmp = storage.tmp_pdf_path(jid, "fast", second.attempts)
         with open(fresh_tmp, "wb") as fh:
             fh.write(b"%PDF-1.5 fresh")
-        assert repository.publish_success(db, jid, "fast", fresh_tmp, final) is True
+        fresh_size, fresh_digest = _fp(fresh_tmp)
+        assert (
+            repository.publish_success(
+                db, jid, "fast", fresh_tmp, final, fresh_size, fresh_digest
+            )
+            is True
+        )
 
         done = repository.get_job(db, jid)
         assert done.status == STATUS_SUCCEEDED and done.pdf_path == final
+        # The fingerprint registered with the path describes the winner.
+        assert done.pdf_size == fresh_size and done.pdf_sha256 == fresh_digest
         with open(final, "rb") as fh:
             assert fh.read() == b"%PDF-1.5 fresh"  # late result never overwrote
     finally:
@@ -205,11 +235,19 @@ def test_publish_success_by_current_owner(clean_db):
         final = storage.final_pdf_path(jid)
         with open(tmp, "wb") as fh:
             fh.write(b"%PDF-1.5 real")
-        assert repository.publish_success(db, jid, "owner-A", tmp, final) is True
+        size, digest = _fp(tmp)
+        assert (
+            repository.publish_success(
+                db, jid, "owner-A", tmp, final, size, digest
+            )
+            is True
+        )
         assert os.path.exists(final) and not os.path.exists(tmp)
         again = db.get(type(job), jid)
         assert again.status == STATUS_SUCCEEDED
         assert again.pdf_path == final
+        assert again.pdf_size == len(b"%PDF-1.5 real")
+        assert again.pdf_sha256 == digest
         assert again.lease_owner is None
     finally:
         db.close()

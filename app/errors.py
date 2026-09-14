@@ -10,6 +10,10 @@ DOCX_MISSING_PARTS = "DOCX_MISSING_PARTS"
 JOB_NOT_FOUND = "JOB_NOT_FOUND"
 JOB_NOT_READY = "JOB_NOT_READY"
 ARTIFACT_MISSING = "ARTIFACT_MISSING"
+# The registered artifact exists on disk but its byte size or SHA-256 digest
+# no longer matches the fingerprint recorded at publish time (shared storage
+# was modified/corrupted). The job row is never rewritten when this is raised.
+ARTIFACT_CORRUPTED = "ARTIFACT_CORRUPTED"
 
 # Conversion.
 CONVERSION_FAILED = "CONVERSION_FAILED"
@@ -27,6 +31,7 @@ HTTP_STATUS = {
     JOB_NOT_FOUND: 404,
     JOB_NOT_READY: 409,
     ARTIFACT_MISSING: 404,
+    ARTIFACT_CORRUPTED: 500,
     CONVERSION_FAILED: 500,
     VALIDATION_ERROR: 400,
     INTERNAL_ERROR: 500,

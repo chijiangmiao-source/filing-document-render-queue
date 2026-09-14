@@ -158,7 +158,13 @@ def renew_lease(db: Session, job_id: str, owner: str, settings: Settings) -> boo
 
 
 def publish_success(
-    db: Session, job_id: str, owner: str, tmp_pdf: str, final_pdf: str
+    db: Session,
+    job_id: str,
+    owner: str,
+    tmp_pdf: str,
+    final_pdf: str,
+    pdf_size: int,
+    pdf_sha256: str,
 ) -> bool:
     """Register the official artifact as the *current, non-expired* holder.
 
@@ -174,7 +180,9 @@ def publish_success(
     the instant the lease lapses; the row stays ``processing`` with the old
     owner until a live worker claims it and converts again from the source.
     The file is moved onto the single deterministic official path only after
-    this gate succeeds, inside the same transaction.
+    this gate succeeds, inside the same transaction that persists the
+    artifact fingerprint (byte size + SHA-256 of ``tmp_pdf``), so the
+    registered path and its fingerprint can never diverge.
     """
     now = now_utc()
     try:
@@ -184,6 +192,8 @@ def publish_success(
                 UPDATE jobs
                    SET status = :succeeded,
                        pdf_path = :pdf_path,
+                       pdf_size = :pdf_size,
+                       pdf_sha256 = :pdf_sha256,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
                        error_code = NULL,
@@ -200,6 +210,8 @@ def publish_success(
                 "succeeded": STATUS_SUCCEEDED,
                 "processing": STATUS_PROCESSING,
                 "pdf_path": final_pdf,
+                "pdf_size": pdf_size,
+                "pdf_sha256": pdf_sha256,
                 "now": now,
                 "id": job_id,
                 "owner": owner,

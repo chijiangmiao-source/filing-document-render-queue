@@ -43,6 +43,13 @@ class Job(Base):
     # Only registered after a successful, lease-checked publish.
     pdf_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
+    # Fingerprint of the official artifact, recorded in the same transaction
+    # that registers ``pdf_path``. NULL for rows published before fingerprints
+    # existed (and for any non-succeeded job): such historical records keep the
+    # original, fingerprint-free download behavior.
+    pdf_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pdf_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(4096), nullable=True)
 

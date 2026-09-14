@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 
@@ -63,10 +64,35 @@ def test_worker_end_to_end_success(clean_db):
         assert done.status == STATUS_SUCCEEDED
         assert done.pdf_path == final
         with open(final, "rb") as fh:
-            assert fh.read(5) == b"%PDF-"
+            pdf = fh.read()
+        assert pdf[:5] == b"%PDF-"
+        # The worker fingerprints the bytes it publishes; the row records the
+        # exact size/SHA-256 in the same gated transaction as the path.
+        assert done.pdf_size == len(pdf)
+        assert done.pdf_sha256 == hashlib.sha256(pdf).hexdigest()
+        registered_size = done.pdf_size
+        registered_sha256 = done.pdf_sha256
         assert not [f for f in os.listdir(os.path.join(settings.storage_dir, "tmp"))]
     finally:
         db.close()
+
+    # The published fingerprint is what the API advertises, serves and validates.
+    from fastapi.testclient import TestClient
+
+    from app.api import app
+
+    client = TestClient(app)
+    body = client.get(f"/jobs/{jid}").json()
+    assert body["artifact_size"] == registered_size
+    assert body["artifact_sha256"] == registered_sha256
+    resp = client.get(f"/jobs/{jid}/download")
+    assert resp.status_code == 200
+    assert resp.headers["etag"] == f'"{registered_sha256}"'
+    cond = client.get(
+        f"/jobs/{jid}/download",
+        headers={"If-None-Match": f'"{registered_sha256}"'},
+    )
+    assert cond.status_code == 304
 
 
 def test_worker_three_attempts_then_terminal_failure(clean_db):

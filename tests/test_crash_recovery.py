@@ -120,10 +120,33 @@ def test_killed_worker_mid_conversion_recovers_to_single_pdf(clean_db):
         _kill_group(w2)
 
     # The download endpoint serves the single official file, never tmp.
+    import hashlib
+
     from fastapi.testclient import TestClient
     from app.api import app
 
     client = TestClient(app)
+    status = client.get(f"/jobs/{jid}").json()
+    with open(final, "rb") as fh:
+        real_pdf = fh.read()
+    assert status["artifact_size"] == len(real_pdf)
+    assert status["artifact_sha256"] == hashlib.sha256(real_pdf).hexdigest()
+
     resp = client.get(f"/jobs/{jid}/download")
     assert resp.status_code == 200
     assert resp.content[:5] == b"%PDF-"
+    assert resp.headers["etag"] == f'"{status["artifact_sha256"]}"'
+    cond = client.get(
+        f"/jobs/{jid}/download",
+        headers={"If-None-Match": f'"{status["artifact_sha256"]}"'},
+    )
+    assert cond.status_code == 304
+
+    # A post-recovery modification of shared storage is refused with the
+    # stable ARTIFACT_CORRUPTED envelope and never rewrites task state.
+    with open(final, "ab") as fh:
+        fh.write(b"\ntampered bytes\n")
+    bad = client.get(f"/jobs/{jid}/download")
+    assert bad.status_code == 500
+    assert bad.json()["error"]["code"] == "ARTIFACT_CORRUPTED"
+    assert client.get(f"/jobs/{jid}").json()["status"] == STATUS_SUCCEEDED

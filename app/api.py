@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -80,7 +81,13 @@ async def _unexpected_handler(_request: Request, exc: Exception) -> JSONResponse
 
 
 def _job_to_status(job: Job) -> JobStatus:
-    download_url = f"/jobs/{job.id}/download" if job.status == STATUS_SUCCEEDED else None
+    succeeded = job.status == STATUS_SUCCEEDED
+    download_url = f"/jobs/{job.id}/download" if succeeded else None
+    # Fingerprints are reported only for successful jobs that were published
+    # with one (new records). Historical rows and unfinished jobs stay null,
+    # so older clients polling the same fields are unaffected.
+    artifact_size = job.pdf_size if (succeeded and job.pdf_sha256) else None
+    artifact_sha256 = job.pdf_sha256 if succeeded else None
     return JobStatus(
         id=job.id,
         status=job.status,
@@ -88,6 +95,8 @@ def _job_to_status(job: Job) -> JobStatus:
         error_code=job.error_code,
         error_message=job.error_message,
         download_url=download_url,
+        artifact_size=artifact_size,
+        artifact_sha256=artifact_sha256,
         created_at=job.created_at,
         updated_at=job.updated_at,
     )
@@ -156,7 +165,9 @@ def get_job(job_id: str, db: Session = Depends(get_session)) -> JobStatus:
 
 
 @app.get("/jobs/{job_id}/download")
-def download_job(job_id: str, db: Session = Depends(get_session)) -> Response:
+def download_job(
+    job_id: str, request: Request, db: Session = Depends(get_session)
+) -> Response:
     job = _load_job_or_404(db, job_id)
     if job.status != STATUS_SUCCEEDED or not job.pdf_path:
         # Failed / in-flight jobs expose a queryable reason but never a URL.
@@ -179,19 +190,69 @@ def download_job(job_id: str, db: Session = Depends(get_session)) -> Response:
 
     with open(pdf_path, "rb") as fh:
         content = fh.read()
+
+    # When the job carries a fingerprint (every job published after the
+    # fingerprint feature shipped), the bytes on the shared store must still
+    # match exactly. A mismatch means the official artifact was modified after
+    # publication: refuse delivery rather than serve a corrupted PDF. This is
+    # checked before anything else (including the %PDF- magic) so any tamper —
+    # even one that also destroys the header — reports the same stable
+    # ARTIFACT_CORRUPTED code. The job row is intentionally left untouched:
+    # corruption is a storage event, not a task state transition. Historical
+    # rows without a fingerprint keep the original, unverified behavior.
+    fingerprinted = bool(job.pdf_sha256)
+    if fingerprinted:
+        actual_size = len(content)
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_size != job.pdf_size or actual_sha256 != job.pdf_sha256:
+            raise APIError(
+                errors.ARTIFACT_CORRUPTED,
+                "stored artifact is corrupted: size or checksum "
+                "does not match the registered fingerprint",
+            )
+
     if not content.startswith(b"%PDF-"):
-        # A registered file that lost its magic is corruption, not a download.
+        # Only reachable for legacy, fingerprint-free records: a registered
+        # file that lost its magic is unavailable rather than downloadable.
         raise APIError(errors.ARTIFACT_MISSING, "registered artifact is unavailable")
 
     download_name = f"{os.path.splitext(job.original_filename)[0] or job.id}.pdf"
+    common_headers = {
+        "Content-Disposition": f'attachment; filename="{download_name}"',
+        "X-Job-Id": job.id,
+    }
+
+    # The registered digest is the strong validator for the artifact. A
+    # matching If-None-Match answers 304 without re-sending the bytes; legacy
+    # fingerprint-free records simply carry no ETag and always return 200.
+    if fingerprinted:
+        etag = f'"{job.pdf_sha256}"'
+        common_headers["ETag"] = etag
+        if _etag_matches(request.headers.get("if-none-match"), job.pdf_sha256):
+            return Response(status_code=304, headers=common_headers)
+
     return Response(
         content=content,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{download_name}"',
-            "X-Job-Id": job.id,
-        },
+        headers=common_headers,
     )
+
+
+def _etag_matches(header_value: str | None, expected_sha256: str) -> bool:
+    """Match an If-None-Match header against the artifact digest.
+
+    Accepts the exact quoted strong validator and ``*``; tolerates a list of
+    comma-separated etags and surrounding whitespace. Weak (``W/``) validators
+    are not produced by this service and are ignored.
+    """
+    if not header_value:
+        return False
+    target = f'"{expected_sha256}"'
+    for token in header_value.split(","):
+        token = token.strip()
+        if token == "*" or token == target:
+            return True
+    return False
 
 
 @app.get("/healthz")

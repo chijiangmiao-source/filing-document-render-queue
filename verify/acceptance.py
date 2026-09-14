@@ -10,15 +10,26 @@ Proves the end-to-end contract against a running docker compose stack:
      ends with exactly one downloadable PDF beginning with %PDF-.
   2. A document that passes container validation but cannot render ends in a
      terminal failure: reason is queryable and there is no download URL.
-  3. Invalid containers never create a task, with stable error codes
+  2. The recovered job's query response carries size + SHA-256 matching the
+     downloaded bytes; the digest is the download ETag and a matching
+     If-None-Match returns 304. Tampering with the official PDF on the shared
+     store then fails the download with a stable ARTIFACT_CORRUPTED envelope
+     (never a corrupt body, never a 304) without rewriting the task status.
+  3. A document that passes container validation but cannot render ends in a
+     terminal failure: reason is queryable and there is no download URL.
+  4. Invalid containers never create a task, with stable error codes
      (NOT_A_ZIP / DOCX_MISSING_PARTS / FILE_TOO_LARGE / JOB_NOT_FOUND).
+  5. Historical succeeded records without a fingerprint keep the original
+     query/download behavior (null fingerprint fields, no ETag, no 304).
 
 Run (compose):  docker compose --profile verify run --rm verify
 """
 
+import hashlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -26,11 +37,13 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from datetime import datetime, timezone
 
 from . import fixtures
 
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
 STORAGE_DIR = os.getenv("STORAGE_DIR", "/data/storage")
+DB_PATH = os.getenv("DB_PATH", "/data/docx2pdf.db")
 WORKER_LABEL = os.getenv("WORKER_SERVICE", "worker")
 
 # Timing is derived from the lease contract (30s) plus real conversion time.
@@ -89,6 +102,21 @@ def upload(content: bytes, filename: str = "doc.docx"):
 
 def get(path: str):
     return _request("GET", path)
+
+
+def _header(headers: dict, name: str) -> str | None:
+    """Case-insensitive response/header lookup."""
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
+
+
+def _db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
 
 
 def wait_health() -> None:
@@ -202,6 +230,34 @@ def check_crash_recovery() -> None:
     check(pdf[:5] == b"%PDF-", "downloaded artifact starts with %PDF-")
     check(len(pdf) > 1000, f"artifact is a real rendered PDF ({len(pdf)} bytes)")
 
+    # The query response advertises a fingerprint that matches the bytes
+    # actually delivered (new jobs are published with size + SHA-256).
+    want_size = len(pdf)
+    want_digest = hashlib.sha256(pdf).hexdigest()
+    check(final.get("artifact_size") == want_size,
+          f"query artifact_size matches download ({want_size} bytes)")
+    check(final.get("artifact_sha256") == want_digest,
+          "query artifact_sha256 matches the downloaded PDF digest")
+    check(_header(headers, "etag") == f'"{want_digest}"',
+          "download ETag is the registered SHA-256")
+
+    # Conditional download: a matching If-None-Match yields 304 with no body
+    # but keeps the validator; a wrong validator re-serves the bytes.
+    st304, h304, body304 = _request(
+        "GET", final["download_url"],
+        headers={"If-None-Match": f'"{want_digest}"'},
+    )
+    check(st304 == 304 and body304 == b"",
+          f"matching If-None-Match returns 304 with empty body (got {st304})")
+    check(_header(h304, "etag") == f'"{want_digest}"',
+          "304 response carries the same ETag")
+    st200, _, pdf2 = _request(
+        "GET", final["download_url"],
+        headers={"If-None-Match": f'"{"f" * 64}"'},
+    )
+    check(st200 == 200 and pdf2 == pdf,
+          "non-matching validator re-downloads the identical PDF")
+
     # Exactly one official artifact on disk; no tmp file is ever served.
     pdf_dir = os.path.join(STORAGE_DIR, "pdf")
     on_disk = sorted(f for f in os.listdir(pdf_dir) if f.startswith(job_id))
@@ -211,9 +267,70 @@ def check_crash_recovery() -> None:
     leftovers = [f for f in os.listdir(tmp_dir) if f.startswith(job_id)]
     check(not leftovers, f"no lingering tmp artifacts: {leftovers}")
 
+    return job_id, want_digest
+
+
+def check_tampered_artifact_rejected(job_id: str, digest: str) -> None:
+    print("\n[2] tamper the official PDF on shared storage -> ARTIFACT_CORRUPTED")
+    pdf_path = os.path.join(STORAGE_DIR, "pdf", f"{job_id}.pdf")
+    check(os.path.isfile(pdf_path), f"official artifact exists: {pdf_path}")
+    with open(pdf_path, "rb") as fh:
+        original = fh.read()
+    try:
+        # Out-of-band modification of the shared store (preserve %PDF- magic so
+        # the test isolates the fingerprint guard, not the legacy magic check).
+        with open(pdf_path, "ab") as fh:
+            fh.write(b"\n%% shared storage was modified out of band\n")
+
+        st, _, raw = get(f"/jobs/{job_id}/download")
+        body = json.loads(raw)
+        check(st == 500, f"tampered artifact is not delivered (got {st})")
+        check(body["error"]["code"] == "ARTIFACT_CORRUPTED",
+              f"stable code ARTIFACT_CORRUPTED, got {body['error'].get('code')}")
+
+        # A conditional request must not be tricked into 304 either.
+        st304, _, _ = _request(
+            "GET", f"/jobs/{job_id}/download",
+            headers={"If-None-Match": f'"{digest}"'},
+        )
+        check(st304 == 500,
+              f"tampered artifact never answers 304 (got {st304})")
+
+        # The task status must not be rewritten by the storage event.
+        status, _, sraw = get(f"/jobs/{job_id}")
+        state = json.loads(sraw)
+        check(status == 200 and state["status"] == "succeeded",
+              "job remains succeeded after corruption is detected")
+        check(state.get("artifact_sha256") == digest,
+              "registered fingerprint is unchanged in the query response")
+        check(state["download_url"] == f"/jobs/{job_id}/download",
+              "download URL is still advertised")
+
+        conn = _db()
+        try:
+            row = conn.execute(
+                "SELECT status, pdf_size, pdf_sha256, error_code FROM jobs "
+                "WHERE id = ?",
+                (job_id,),
+            ).one()
+            check(row[0] == "succeeded" and row[2] == digest,
+                  f"job row is untouched (status={row[0]})")
+            check(row[3] is None, "no error code is written onto the job")
+        finally:
+            conn.close()
+    finally:
+        # Restore so later manual inspection/downloads behave normally.
+        with open(pdf_path, "wb") as fh:
+            fh.write(original)
+
+    st, hdr, restored = get(f"/jobs/{job_id}/download")
+    check(st == 200 and hashlib.sha256(restored).hexdigest() == digest,
+          "restored artifact downloads again with the registered digest")
+    check(_header(hdr, "etag") == f'"{digest}"', "ETag restored with the file")
+
 
 def check_unrenderable_document() -> None:
-    print("\n[2] structurally valid but unrenderable document -> terminal fail")
+    print("\n[3] structurally valid but unrenderable document -> terminal fail")
     status, _, raw = upload(
         fixtures.structurally_present_but_corrupt_docx(), "broken.docx"
     )
@@ -235,7 +352,7 @@ def check_unrenderable_document() -> None:
 
 
 def check_rejected_containers() -> None:
-    print("\n[3] bad uploads never create tasks and return stable codes")
+    print("\n[4] bad uploads never create tasks and return stable codes")
 
     st, _, raw = upload(fixtures.not_a_zip(), "fake.docx")
     body = json.loads(raw)
@@ -264,14 +381,81 @@ def check_rejected_containers() -> None:
           f"unknown job -> 404 JOB_NOT_FOUND (got {st})")
 
 
+def check_legacy_records_compatible(original_job_id: str) -> None:
+    print("\n[5] historical fingerprint-free records keep the old behavior")
+    src_pdf = os.path.join(STORAGE_DIR, "pdf", f"{original_job_id}.pdf")
+    with open(src_pdf, "rb") as fh:
+        pdf = fh.read()
+
+    legacy_id = str(uuid.uuid4())
+    legacy_pdf = os.path.join(STORAGE_DIR, "pdf", f"{legacy_id}.pdf")
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+    try:
+        with open(legacy_pdf, "wb") as fh:
+            fh.write(pdf)
+        conn = _db()
+        try:
+            # A succeeded row exactly as an older build would have committed it:
+            # official path registered, fingerprint columns left NULL.
+            conn.execute(
+                "INSERT INTO jobs (id, original_filename, source_path, status, "
+                "attempts, lease_owner, lease_expires_at, pdf_path, pdf_size, "
+                "pdf_sha256, error_code, error_message, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'succeeded', 1, NULL, NULL, ?, NULL, NULL, "
+                "NULL, NULL, ?, ?)",
+                (legacy_id, f"{legacy_id}.docx",
+                 f"/data/storage/source/{legacy_id}.docx",
+                 legacy_pdf, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        st, _, raw = get(f"/jobs/{legacy_id}")
+        body = json.loads(raw)
+        check(st == 200 and body["status"] == "succeeded",
+              "legacy succeeded job is still queryable")
+        check(body.get("artifact_size") is None
+              and body.get("artifact_sha256") is None,
+              "legacy query omits the fingerprint (new fields are null)")
+        check(body["download_url"] == f"/jobs/{legacy_id}/download",
+              "legacy job keeps its original download URL")
+
+        st, headers, delivered = get(f"/jobs/{legacy_id}/download")
+        check(st == 200 and delivered == pdf,
+              "legacy artifact downloads with the original behavior")
+        check(_header(headers, "etag") is None,
+              "no ETag is emitted for fingerprint-free records")
+
+        digest = hashlib.sha256(pdf).hexdigest()
+        st, _, _ = _request(
+            "GET", f"/jobs/{legacy_id}/download",
+            headers={"If-None-Match": f'"{digest}"'},
+        )
+        check(st == 200, "conditional request never 304s a legacy record")
+    finally:
+        conn = _db()
+        try:
+            conn.execute("DELETE FROM jobs WHERE id = ?", (legacy_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            os.remove(legacy_pdf)
+        except FileNotFoundError:
+            pass
+
+
 def main() -> int:
     print(f"Acceptance against {API_BASE}")
     wait_health()
     print("API healthy")
     try:
-        check_crash_recovery()
+        recovered_id, recovered_digest = check_crash_recovery()
+        check_tampered_artifact_rejected(recovered_id, recovered_digest)
         check_unrenderable_document()
         check_rejected_containers()
+        check_legacy_records_compatible(recovered_id)
     except CheckFailed as exc:
         print(f"\nACCEPTANCE FAILED: {exc}", file=sys.stderr)
         return 1
