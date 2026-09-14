@@ -1,5 +1,4 @@
 # Single image for API, worker and the one-shot verifier.
-# Base: pinned Python minor on Debian bookworm.
 FROM python:3.11-slim-bookworm AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
@@ -7,28 +6,48 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# --- Reproducible, version-pinned LibreOffice ---------------------------------
-# Freeze apt to a single Debian snapshot and install an exact LibreOffice
-# build, so "fixed version in the container" is a concrete, reproducible
-# binary: 1:7.4.7-1+deb12u14 from snapshot 20260701T084025Z.
-ARG DEBIAN_SNAPSHOT=20260701T084025Z
-ARG LIBREOFFICE_VERSION=4:7.4.7-1+deb12u14
+# --- Pinned, checksum-verified LibreOffice ------------------------------------
+# The converter is an EXACT upstream build (LibreOffice 26.2.6.3) fetched from
+# The Document Foundation and verified by a per-architecture SHA-256, so the
+# binary is concrete and immutable. Shared-system dependencies are resolved
+# from the standard bookworm repo in a single apt transaction.
+ARG LO_UPSTREAM=26.2.6
+ARG LO_BUILD=26.2.6.3
+ARG TARGETARCH
 RUN set -eux; \
-    printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "5";\n' \
-        > /etc/apt/apt.conf.d/99snapshot; \
-    rm -f /etc/apt/sources.list.d/debian.sources; \
-    printf 'deb http://snapshot.debian.org/archive/debian/%s bookworm main\n' \
-        "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list; \
+    arch_name="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch_name" in \
+      amd64) \
+        url_arch=x86_64; file_arch=x86-64; \
+        lo_sum=fd0e8f8f2408dd2e5b90286e60f3f97cf566ba441cd48cfc5bcc68067303e0bc ;; \
+      arm64) \
+        url_arch=aarch64; file_arch=aarch64; \
+        lo_sum=f8e8b1d30abde0d530d727ce1b26909ccbedc3d76bcf75d93b3dd5fcd5b8d278 ;; \
+      *) echo "unsupported architecture=$arch_name" >&2; exit 1 ;; \
+    esac; \
     apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    tarball="LibreOffice_${LO_UPSTREAM}_Linux_${file_arch}_deb.tar.gz"; \
+    archive_tarball="LibreOffice_${LO_BUILD}_Linux_${file_arch}_deb.tar.gz"; \
+    # Primary mirror, then the immutable official archive as fallback.
+    curl -fsSL -o /tmp/lo.tar.gz \
+        "https://download.documentfoundation.org/libreoffice/stable/${LO_UPSTREAM}/deb/${url_arch}/${tarball}" \
+     || curl -fsSL -o /tmp/lo.tar.gz \
+        "https://downloadarchive.documentfoundation.org/libreoffice/old/${LO_BUILD}/deb/${url_arch}/${archive_tarball}"; \
+    echo "${lo_sum}  /tmp/lo.tar.gz" | sha256sum -c -; \
+    mkdir -p /tmp/lo; \
+    tar -xzf /tmp/lo.tar.gz -C /tmp/lo; \
+    deb_dir="/tmp/lo/LibreOffice_${LO_BUILD}_Linux_${file_arch}_deb/DEBS"; \
+    test -d "$deb_dir"; \
+    # Single apt transaction installs the bundled, pinned debs and resolves
+    # their shared-library dependencies from bookworm (fails loudly if not).
+    apt-get install -y --no-install-recommends "$deb_dir"/*.deb; \
     apt-get install -y --no-install-recommends \
-        "libreoffice-writer-nogui=$LIBREOFFICE_VERSION" \
-        "libreoffice-core-nogui=$LIBREOFFICE_VERSION" \
-        fonts-liberation \
-        fonts-noto-cjk \
-        ca-certificates \
-        curl; \
-    rm -rf /var/lib/apt/lists/*; \
-    soffice --version
+        fontconfig fonts-liberation fonts-noto-cjk; \
+    ln -sf /opt/libreoffice26.2/program/soffice /usr/local/bin/soffice; \
+    # Hard build-time check: fail early if a runtime library is missing.
+    /opt/libreoffice26.2/program/soffice --version; \
+    rm -rf /var/lib/apt/lists/* /tmp/lo /tmp/lo.tar.gz
 
 WORKDIR /srv
 
@@ -41,9 +60,6 @@ COPY verify ./verify
 # Pinned static docker CLI, used only by the one-shot "verify" service to kill
 # and restart the worker container through the mounted Docker socket.
 ARG DOCKER_CLI_VERSION=26.1.4
-# TARGETARCH is supplied automatically by BuildKit (amd64 / arm64); fall back
-# to dpkg architecture for non-BuildKit builds.
-ARG TARGETARCH
 RUN set -eux; \
     arch_name="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     case "$arch_name" in \
@@ -61,7 +77,7 @@ RUN set -eux; \
 RUN mkdir -p /data/storage/source /data/storage/tmp /data/storage/pdf
 ENV DATABASE_URL=sqlite:////data/docx2pdf.db \
     STORAGE_DIR=/data/storage \
-    SOFFICE_BIN=/usr/lib/libreoffice/program/soffice
+    SOFFICE_BIN=/opt/libreoffice26.2/program/soffice
 
 EXPOSE 8000
 

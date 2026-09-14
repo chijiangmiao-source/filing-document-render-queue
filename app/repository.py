@@ -125,7 +125,13 @@ def claim_next_job(
 
 
 def renew_lease(db: Session, job_id: str, owner: str, settings: Settings) -> bool:
-    """Extend the lease. Returns False if this owner no longer holds the job."""
+    """Extend the lease.
+
+    Renewal is granted only while the lease is still *valid*. Once
+    ``lease_expires_at`` has passed, the original owner has lost the job even
+    if no one has overwritten ``lease_owner`` yet; it must not be able to
+    extend a dead lease.
+    """
     now = now_utc()
     expires = now + timedelta(seconds=settings.lease_seconds)
     result = db.execute(
@@ -133,7 +139,10 @@ def renew_lease(db: Session, job_id: str, owner: str, settings: Settings) -> boo
             """
             UPDATE jobs
                SET lease_expires_at = :expires, updated_at = :now
-             WHERE id = :id AND lease_owner = :owner AND status = :processing
+             WHERE id = :id
+               AND lease_owner = :owner
+               AND status = :processing
+               AND lease_expires_at > :now
             """
         ),
         {
@@ -151,12 +160,21 @@ def renew_lease(db: Session, job_id: str, owner: str, settings: Settings) -> boo
 def publish_success(
     db: Session, job_id: str, owner: str, tmp_pdf: str, final_pdf: str
 ) -> bool:
-    """Register the official artifact as the *current* lease holder.
+    """Register the official artifact as the *current, non-expired* holder.
 
-    The conditional UPDATE is the gate: a worker whose lease expired and was
-    taken over gets rowcount 0 and must discard its late result. The file is
-    moved onto the single deterministic official path inside the same
-    transaction, after the CAS gate succeeds.
+    The gate has two tests:
+
+    * ``lease_owner = :owner`` — this worker still owns the job; and
+    * ``lease_expires_at > :now`` — the lease has not actually expired.
+
+    The second test is essential: there is a window after expiry and before
+    another worker overwrites ``lease_owner`` during which the owner field
+    still names the original process. Without the time fence that stale
+    process could still publish its late PDF. With it, publication is refused
+    the instant the lease lapses; the row stays ``processing`` with the old
+    owner until a live worker claims it and converts again from the source.
+    The file is moved onto the single deterministic official path only after
+    this gate succeeds, inside the same transaction.
     """
     now = now_utc()
     try:
@@ -174,6 +192,7 @@ def publish_success(
                  WHERE id = :id
                    AND lease_owner = :owner
                    AND status = :processing
+                   AND lease_expires_at > :now
                    AND pdf_path IS NULL
                 """
             ),
@@ -220,15 +239,23 @@ def record_failure(
 ) -> str:
     """Record a conversion attempt failure; returns the resulting status.
 
-    Only the current lease holder may record. The last allowed attempt lands
-    the job in the terminal ``failed`` state; earlier attempts release the
-    job back to ``pending`` so another worker can retry from the original.
+    Only the *current, non-expired* lease holder may record. The last allowed
+    attempt lands the job in the terminal ``failed`` state; earlier attempts
+    release the job back to ``pending`` so another worker can retry from the
+    original. If the lease has expired the call returns "" and the caller
+    discards its attempt artifacts (a live worker will take over).
     """
     now = now_utc()
     job = db.get(Job, job_id)
-    if job is None or job.lease_owner != owner or job.status != STATUS_PROCESSING:
+    if (
+        job is None
+        or job.lease_owner != owner
+        or job.status != STATUS_PROCESSING
+        or job.lease_expires_at is None
+        or job.lease_expires_at <= now
+    ):
         db.rollback()
-        return ""  # lost the lease; caller discards its attempt artifacts
+        return ""  # lost/expired lease; caller discards its attempt artifacts
 
     terminal = job.attempts >= settings.max_attempts
     new_status = STATUS_FAILED if terminal else STATUS_PENDING
@@ -242,7 +269,10 @@ def record_failure(
                    error_code = :code,
                    error_message = :message,
                    updated_at = :now
-             WHERE id = :id AND lease_owner = :owner AND status = :processing
+             WHERE id = :id
+               AND lease_owner = :owner
+               AND status = :processing
+               AND lease_expires_at > :now
             """
         ),
         {

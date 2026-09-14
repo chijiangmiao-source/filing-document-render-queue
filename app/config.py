@@ -5,10 +5,10 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Pinned LibreOffice inside the container: Debian snapshot
-# 20260701T084025Z ships libreoffice 4:7.4.7-1+deb12u14 (see Dockerfile).
-# The whole apt index is frozen to that snapshot, so the build is reproducible.
-DEFAULT_SOFFICE_BIN = "/usr/lib/libreoffice/program/soffice"
+# Pinned LibreOffice inside the container: The Document Foundation build
+# 26.2.6.3 installed at /opt/libreoffice26.2 (see Dockerfile), fetched and
+# SHA-256 verified per architecture.
+DEFAULT_SOFFICE_BIN = "/opt/libreoffice26.2/program/soffice"
 
 TEN_MIB = 10 * 1024 * 1024
 

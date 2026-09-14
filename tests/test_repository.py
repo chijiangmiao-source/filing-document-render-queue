@@ -128,6 +128,73 @@ def test_publish_gate_rejects_stale_owner(clean_db):
         db.close()
 
 
+def test_expired_lease_still_named_me_fences_every_write(clean_db):
+    # The critical fencing case: the lease has expired, but no contender has
+    # overwritten lease_owner yet. The stale original process must still be
+    # refused renew / publish / record-failure.
+    jid = _make_job()
+    s = get_settings()
+    db = SessionLocal()
+    try:
+        job = repository.claim_next_job(db, "owner-A", s)
+        assert job.attempts == 1
+        tmp = storage.tmp_pdf_path(jid, "owner-A", job.attempts)
+        final = storage.final_pdf_path(jid)
+        with open(tmp, "wb") as fh:
+            fh.write(b"%PDF-1.5 late")
+
+        # Expire the lease WITHOUT changing owner (contender not arrived yet).
+        job.lease_expires_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+
+        assert repository.renew_lease(db, jid, "owner-A", s) is False
+        assert repository.publish_success(db, jid, "owner-A", tmp, final) is False
+        assert (
+            repository.record_failure(db, jid, "owner-A", s,
+                                      "CONVERSION_FAILED", "late") == ""
+        )
+
+        # Nothing landed: no official file, row still processing with old owner.
+        assert not os.path.exists(final)
+        row = repository.get_job(db, jid)
+        assert row.status == STATUS_PROCESSING
+        assert row.lease_owner == "owner-A"
+        assert row.pdf_path is None
+    finally:
+        db.close()
+
+
+def test_late_publish_rejected_then_fresh_claim_converts_and_wins(clean_db):
+    jid = _make_job()
+    s = get_settings()
+    db = SessionLocal()
+    try:
+        first = repository.claim_next_job(db, "slow", s)
+        late_tmp = storage.tmp_pdf_path(jid, "slow", first.attempts)
+        with open(late_tmp, "wb") as fh:
+            fh.write(b"%PDF-1.5 slow-late")
+        # slow's lease expires; it tries (and fails) to publish.
+        first.lease_expires_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+        final = storage.final_pdf_path(jid)
+        assert repository.publish_success(db, jid, "slow", late_tmp, final) is False
+
+        # A live worker re-claims from the expired lease and re-converts.
+        second = repository.claim_next_job(db, "fast", s)
+        assert second.lease_owner == "fast" and second.attempts == 2
+        fresh_tmp = storage.tmp_pdf_path(jid, "fast", second.attempts)
+        with open(fresh_tmp, "wb") as fh:
+            fh.write(b"%PDF-1.5 fresh")
+        assert repository.publish_success(db, jid, "fast", fresh_tmp, final) is True
+
+        done = repository.get_job(db, jid)
+        assert done.status == STATUS_SUCCEEDED and done.pdf_path == final
+        with open(final, "rb") as fh:
+            assert fh.read() == b"%PDF-1.5 fresh"  # late result never overwrote
+    finally:
+        db.close()
+
+
 def test_publish_success_by_current_owner(clean_db):
     jid = _make_job()
     s = get_settings()

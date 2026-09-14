@@ -112,7 +112,13 @@ def process_job(db: Session, job, owner: str, settings: Settings) -> None:
                 str(exc),
             )
             storage.remove_quiet(tmp_pdf)
-            if new_status == STATUS_FAILED:
+            if new_status == "":
+                # Lease expired (or was taken) before we could record: the
+                # attempt no longer belongs to us; a live worker will retry.
+                log.warning(
+                    "job %s: lease expired before recording failure; dropping", job.id
+                )
+            elif new_status == STATUS_FAILED:
                 log.error("job %s terminal failure after %d attempts", job.id, attempt)
             else:
                 log.warning("job %s attempt %d failed; requeued: %s", job.id, attempt, exc)
@@ -127,8 +133,14 @@ def process_job(db: Session, job, owner: str, settings: Settings) -> None:
         final_pdf = storage.final_pdf_path(job.id)
         published = repository.publish_success(db, job.id, owner, tmp_pdf, final_pdf)
         if not published:
-            # Lost the race between the last renewal and the publish commit.
-            log.warning("job %s: rejected at publish gate; discarding result", job.id)
+            # The lease expired (or was taken) between the last renewal and
+            # the publish commit. Reject the late result; a live holder that
+            # still owns a valid lease converts again and is the sole winner.
+            log.warning(
+                "job %s: rejected at publish gate (lease expired/taken); "
+                "discarding late result",
+                job.id,
+            )
             storage.remove_quiet(tmp_pdf)
             return
         log.info("job %s succeeded -> %s", job.id, final_pdf)

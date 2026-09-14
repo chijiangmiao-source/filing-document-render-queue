@@ -80,9 +80,14 @@ checksum-pinned static `docker` CLI baked into the image.
 
 ## Reproducible converter version
 
-The image freezes `apt` to Debian snapshot `20260701T084025Z` and installs an
-exact build — `libreoffice-writer-nogui=4:7.4.7-1+deb12u14` — rather than a
-floating candidate, so the converter is concrete and reproducible.
+The image installs an **exact** The Document Foundation build —
+**LibreOffice `26.2.6.3`** — fetched per architecture
+(`.../stable/26.2.6/deb/{x86_64,aarch64}/LibreOffice_26.2.6_Linux_*_deb.tar.gz`)
+and verified by a pinned **SHA-256** before extraction, then installed with its
+shared-library dependencies from bookworm in a single `apt` transaction. The
+build hard-fails if the checksum mismatches or `soffice --version` cannot run,
+so the converter is concrete, immutable and never a floating package or a
+fake/bundled PDF.
 
 ## Stable error codes
 
