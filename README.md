@@ -83,11 +83,24 @@ checksum-pinned static `docker` CLI baked into the image.
 The image installs an **exact** The Document Foundation build —
 **LibreOffice `26.2.6.3`** — fetched per architecture
 (`.../stable/26.2.6/deb/{x86_64,aarch64}/LibreOffice_26.2.6_Linux_*_deb.tar.gz`)
-and verified by a pinned **SHA-256** before extraction, then installed with its
-shared-library dependencies from bookworm in a single `apt` transaction. The
-build hard-fails if the checksum mismatches or `soffice --version` cannot run,
-so the converter is concrete, immutable and never a floating package or a
-fake/bundled PDF.
+and verified by a pinned **SHA-256** before extraction.
+
+The upstream `.deb`s ship with **empty `Depends`**, so apt pulls no shared
+libraries for them. The Dockerfile therefore installs, in **one apt
+transaction**, the pinned debs plus an explicit, architecture-independent list
+of headless runtime libraries (Xinerama, cups, dbus, cairo, nss/nspr,
+fontconfig/freetype, X11, …). That list was derived empirically (`LD_DEBUG`
+during a real `--headless writer_pdf_Export` run) and proven on a fresh
+bookworm sysroot with **zero missing `NEEDED` libraries**, converting both
+text- and image-heavy documents. All 62 package names exist on both
+`arm64` and `amd64`.
+
+As a final guard, the build itself generates a minimal DOCX (stdlib only),
+converts it to PDF and asserts the `%PDF-` magic (`docker/build_gate.py`). A
+missing runtime library — notably on **ARM64** — therefore fails
+`docker build` immediately instead of crashing the worker/API at startup. The
+gate PDF is deleted; the repository never ships a PDF and uses no fake
+converter.
 
 ## Stable error codes
 

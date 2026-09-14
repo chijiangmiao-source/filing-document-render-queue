@@ -9,11 +9,19 @@ ENV PYTHONUNBUFFERED=1 \
 # --- Pinned, checksum-verified LibreOffice ------------------------------------
 # The converter is an EXACT upstream build (LibreOffice 26.2.6.3) fetched from
 # The Document Foundation and verified by a per-architecture SHA-256, so the
-# binary is concrete and immutable. Shared-system dependencies are resolved
-# from the standard bookworm repo in a single apt transaction.
+# binary is concrete and immutable.
+#
+# IMPORTANT: the TDF .debs ship with EMPTY Depends metadata, so apt will not
+# pull any shared libraries for them. The RUNTIME_LIBS list below is the exact
+# set of system libraries a headless writer_pdf_Export run needs; it was
+# derived empirically (LD_DEBUG during a real --headless conversion) and proven
+# on a fresh bookworm sysroot where soffice converts text and image documents
+# with zero missing NEEDED libs. Keep the debs and these libs in ONE apt
+# transaction so the build fails loudly if anything is unresolvable.
 ARG LO_UPSTREAM=26.2.6
 ARG LO_BUILD=26.2.6.3
 ARG TARGETARCH
+COPY docker/build_gate.py /tmp/build_gate.py
 RUN set -eux; \
     arch_name="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     case "$arch_name" in \
@@ -39,15 +47,87 @@ RUN set -eux; \
     tar -xzf /tmp/lo.tar.gz -C /tmp/lo; \
     deb_dir="/tmp/lo/LibreOffice_${LO_BUILD}_Linux_${file_arch}_deb/DEBS"; \
     test -d "$deb_dir"; \
-    # Single apt transaction installs the bundled, pinned debs and resolves
-    # their shared-library dependencies from bookworm (fails loudly if not).
-    apt-get install -y --no-install-recommends "$deb_dir"/*.deb; \
+    # Install the pinned local debs together with the explicit headless
+    # runtime libraries they fail to declare.
     apt-get install -y --no-install-recommends \
-        fontconfig fonts-liberation fonts-noto-cjk; \
+        "$deb_dir"/*.deb \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation \
+        fonts-noto-cjk \
+        libavahi-client3 \
+        libavahi-common3 \
+        libblkid1 \
+        libbrotli1 \
+        libbsd0 \
+        libc6 \
+        libcairo2 \
+        libcap2 \
+        libcom-err2 \
+        libcups2 \
+        libdbus-1-3 \
+        libelogind0 \
+        libexpat1 \
+        libffi8 \
+        libfontconfig1 \
+        libfreetype6 \
+        libgcc-s1 \
+        libgcrypt20 \
+        libglib2.0-0 \
+        libgmp10 \
+        libgnutls30 \
+        libgpg-error0 \
+        libgssapi-krb5-2 \
+        libhogweed6 \
+        libidn2-0 \
+        libk5crypto3 \
+        libkeyutils1 \
+        libkrb5-3 \
+        libkrb5support0 \
+        liblz4-1 \
+        liblzma5 \
+        libmd0 \
+        libmount1 \
+        libnettle8 \
+        libnspr4 \
+        libnss3 \
+        libp11-kit0 \
+        libpcre2-8-0 \
+        libpixman-1-0 \
+        libpng16-16 \
+        libselinux1 \
+        libsqlite3-0 \
+        libstdc++6 \
+        libtasn1-6 \
+        libunistring2 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxau6 \
+        libxcb-render0 \
+        libxcb-shm0 \
+        libxcb1 \
+        libxdmcp6 \
+        libxext6 \
+        libxinerama1 \
+        libxrender1 \
+        libzadc4 \
+        libzstd1 \
+        ocl-icd-libopencl1; \
     ln -sf /opt/libreoffice26.2/program/soffice /usr/local/bin/soffice; \
-    # Hard build-time check: fail early if a runtime library is missing.
-    /opt/libreoffice26.2/program/soffice --version; \
-    rm -rf /var/lib/apt/lists/* /tmp/lo /tmp/lo.tar.gz
+    # Definitive build gate: actually run a headless DOCX->PDF conversion.
+    # This loads the real filter/VCL libraries, so a missing ARM64 runtime
+    # library fails the BUILD here rather than at worker startup. The docx is
+    # generated on the fly (stdlib) and the PDF is removed; none is shipped.
+    python3 /tmp/build_gate.py /tmp/gate.docx; \
+    mkdir -p /tmp/gateout; \
+    /opt/libreoffice26.2/program/soffice --headless --norestore --nolockcheck \
+        --nodefault -env:UserInstallation=file:///tmp/gateprofile \
+        --convert-to pdf --outdir /tmp/gateout /tmp/gate.docx; \
+    test -f /tmp/gateout/gate.pdf; \
+    head -c 5 /tmp/gateout/gate.pdf | grep -q '%PDF-'; \
+    echo 'LibreOffice build gate: %PDF- OK'; \
+    rm -rf /var/lib/apt/lists/* /tmp/lo /tmp/lo.tar.gz \
+        /tmp/gate.docx /tmp/gateout /tmp/gateprofile /tmp/build_gate.py
 
 WORKDIR /srv
 
